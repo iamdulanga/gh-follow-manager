@@ -2,7 +2,7 @@ import requests
 import os
 import time
 
-# Replace with your GitHub username and load token from environment
+# Load GitHub username and token from environment
 username = os.getenv('GITHUB_USERNAME')
 token = os.getenv('GITHUB_TOKEN')
 
@@ -24,6 +24,12 @@ def fetch_all(url):
         url = response.links.get('next', {}).get('url')  # Get next page URL
     return results
 
+# Load exception list
+exception_list = set()
+if os.path.exists("exceptions.txt"):
+    with open("exceptions.txt", "r") as file:
+        exception_list = {line.strip() for line in file if line.strip()}
+
 # Fetch followers and following
 followers_url = f'https://api.github.com/users/{username}/followers'
 following_url = f'https://api.github.com/users/{username}/following'
@@ -35,8 +41,12 @@ following = {user['login'] for user in fetch_all(following_url)}
 not_following_back = following - followers
 not_followed_back = followers - following
 
-# Unfollow users not following back
+# Unfollow users not following back (excluding exceptions)
 for user in not_following_back:
+    if user in exception_list:
+        print(f"Skipping {user} (in exceptions list)")
+        continue
+    
     unfollow_url = f'https://api.github.com/user/following/{user}'
     response = requests.delete(unfollow_url, headers=headers)
     if response.status_code == 204:
