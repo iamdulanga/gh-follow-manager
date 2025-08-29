@@ -1,4 +1,6 @@
-# GitHub Follower-Following Manager
+[![Run GH Follow Manager](https://github.com/iamdulanga/gh-follow-manager/actions/workflows/run-script.yml/badge.svg)](https://github.com/iamdulanga/gh-follow-manager/actions/workflows/run-script.yml)
+
+# GitHub Follower-Following Manager 
 
 This Python script helps you manage your GitHub followers and following lists. It identifies users you're following who don't follow you back and users who follow you but whom you're not following back. You can also automate following or unfollowing based on these lists.
 
@@ -230,3 +232,4 @@ Run on Thursday at 10 PM:
   - 0 or 7 = Sunday
   - 1 = Monday
   - 2 = Tuesday, and so on.
+
