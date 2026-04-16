@@ -1,21 +1,18 @@
 import os
 import time
-from typing import Set, List, Dict
-from dataclasses import dataclass
+from typing import Set, List
 from requests import Session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-@dataclass
-class FollowStats:
-    followed: List[str]
-    unfollowed: List[str]
-    protected_verified: List[str]
-
 class GitHubFollowerManager:
-    """Professional GitHub follower management with verified account protection"""
+    """GitHub follower management with verified account protection"""
     
-    VERIFIED_PROTECTED = {'github', 'microsoft', 'google', 'facebook', 'twitter', 'vercel', 'netlify'}
+    # Verified accounts that should never be unfollowed
+    VERIFIED_PROTECTED = {
+        'github', 'microsoft', 'google', 'facebook', 'twitter', 'vercel', 
+        'netlify', 'aws', 'cloudflare', 'gitlab', 'stackoverflow', 'npmjs'
+    }
     
     def __init__(self):
         self.session = self._create_session()
@@ -23,7 +20,7 @@ class GitHubFollowerManager:
         self.token = os.getenv('GITHUB_TOKEN')
         
         if not self.username or not self.token:
-            raise ValueError("GITHUB_USERNAME and GITHUB_TOKEN environment variables required")
+            raise ValueError("GITHUB_USERNAME and GITHUB_TOKEN required")
         
         self.session.headers.update({
             'Authorization': f'token {self.token}',
@@ -31,7 +28,6 @@ class GitHubFollowerManager:
         })
         
         self.exceptions = self._load_exceptions()
-        self.verified_accounts = self._fetch_verified_status()
     
     def _create_session(self) -> Session:
         """Create optimized session with retry strategy"""
@@ -49,20 +45,8 @@ class GitHubFollowerManager:
         with open("exceptions.txt", "r") as f:
             return {line.strip().lower() for line in f if line.strip()}
     
-    def _fetch_verified_status(self) -> Set[str]:
-        """Fetch verified status for protected accounts"""
-        verified = set()
-        for user in self.VERIFIED_PROTECTED:
-            try:
-                resp = self.session.get(f'https://api.github.com/users/{user}')
-                if resp.status_code == 200 and resp.json().get('site_admin', False):
-                    verified.add(user.lower())
-            except:
-                pass
-        return verified
-    
-    def _paginated_fetch(self, url: str) -> List[Dict]:
-        """Efficient pagination using generator pattern"""
+    def _paginated_fetch(self, url: str) -> List:
+        """Fetch all paginated results"""
         results = []
         while url:
             resp = self.session.get(url)
@@ -72,94 +56,66 @@ class GitHubFollowerManager:
             url = resp.links.get('next', {}).get('url')
         return results
     
-    def _is_verified(self, username: str) -> bool:
-        """Check if account is verified (including fetched status)"""
+    def _is_protected(self, username: str) -> bool:
+        """Check if account should be protected"""
         username_lower = username.lower()
         return (username_lower in self.VERIFIED_PROTECTED or 
-                username_lower in self.verified_accounts or
                 username_lower in self.exceptions)
     
-    def _get_user_follows(self, follow_type: str) -> Set[str]:
-        """Fetch followers or following efficiently"""
-        url = f'https://api.github.com/users/{self.username}/{follow_type}'
-        users = self._paginated_fetch(url)
-        return {user['login'].lower() for user in users}
-    
-    def sync_follows(self) -> FollowStats:
-        """Main sync logic with verified account protection"""
+    def sync_follows(self):
+        """Main sync logic"""
+        print(f"🔄 Syncing @{self.username}")
+        
         # Fetch data
-        followers = self._get_user_follows('followers')
-        following = self._get_user_follows('following')
+        followers_url = f'https://api.github.com/users/{self.username}/followers?per_page=100'
+        following_url = f'https://api.github.com/users/{self.username}/following?per_page=100'
+        
+        followers = {user['login'].lower() for user in self._paginated_fetch(followers_url)}
+        following = {user['login'].lower() for user in self._paginated_fetch(following_url)}
+        
+        print(f"📊 {len(followers)} followers, {len(following)} following")
         
         # Calculate differences
-        not_following_back = following - followers  # I follow, they don't
-        not_followed_back = followers - following   # They follow, I don't
+        not_following_back = following - followers
+        not_followed_back = followers - following
         
-        stats = FollowStats(followed=[], unfollowed=[], protected_verified=[])
-        
-        # Unfollow non-reciprocal accounts (excluding verified/exceptions)
+        # Unfollow non-reciprocal (skip protected)
+        unfollowed = []
         for user in not_following_back:
-            if self._is_verified(user):
-                stats.protected_verified.append(f"{user} (verified/protected)")
+            if self._is_protected(user):
+                print(f"🛡️ Skipped protected: {user}")
                 continue
             
             resp = self.session.delete(f'https://api.github.com/user/following/{user}')
             if resp.status_code == 204:
-                stats.unfollowed.append(user)
+                unfollowed.append(user)
                 print(f"✓ Unfollowed: {user}")
-            else:
-                print(f"✗ Failed to unfollow: {user}")
-            time.sleep(0.5)  # Rate limit protection
-        
-        # Follow back missing accounts
-        for user in not_followed_back:
-            if self._is_verified(user):
-                stats.protected_verified.append(f"{user} (verified - skipped follow)")
-                continue
-                
-            resp = self.session.put(f'https://api.github.com/user/following/{user}')
-            if resp.status_code == 204:
-                stats.followed.append(user)
-                print(f"✓ Followed back: {user}")
-            else:
-                print(f"✗ Failed to follow: {user}")
             time.sleep(0.5)
         
-        return stats
-    
-    def display_report(self, stats: FollowStats):
-        """Generate comprehensive report"""
-        print("\n" + "="*50)
-        print("FOLLOW SYNC REPORT")
-        print("="*50)
+        # Follow back
+        followed = []
+        for user in not_followed_back:
+            resp = self.session.put(f'https://api.github.com/user/following/{user}')
+            if resp.status_code == 204:
+                followed.append(user)
+                print(f"✓ Followed back: {user}")
+            time.sleep(0.5)
         
-        print(f"\n📊 Newly Followed Back: {len(stats.followed)}")
-        if stats.followed:
-            for user in stats.followed:
-                print(f"  → @{user}")
-        
-        print(f"\n🗑️ Unfollowed (non-reciprocal): {len(stats.unfollowed)}")
-        if stats.unfollowed:
-            for user in stats.unfollowed:
-                print(f"  → @{user}")
-        
-        print(f"\n🛡️ Protected from unfollow (verified/exceptions): {len(stats.protected_verified)}")
-        if stats.protected_verified:
-            for user in stats.protected_verified:
-                print(f"  → @{user}")
-        
-        print("\n" + "="*50)
+        # Summary
+        print("\n" + "="*40)
+        print(f"✅ Followed back: {len(followed)}")
+        print(f"🗑️ Unfollowed: {len(unfollowed)}")
+        print(f"🛡️ Protected: {len(not_following_back) - len(unfollowed)}")
+        print("="*40)
 
 def main():
     try:
         manager = GitHubFollowerManager()
-        print("🔄 Syncing GitHub follows...")
-        stats = manager.sync_follows()
-        manager.display_report(stats)
+        manager.sync_follows()
+        return 0
     except Exception as e:
         print(f"❌ Error: {e}")
         return 1
-    return 0
 
 if __name__ == "__main__":
     exit(main())
