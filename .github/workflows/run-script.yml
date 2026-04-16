@@ -1,32 +1,52 @@
- name: Run GH Follow Manager
- 
- on:
-   schedule:
-     # Runs at 00:00 UTC every Sunday
-     - cron: '59 23 * * 0'
- 
- jobs:
-   run-script:
-     runs-on: ubuntu-latest
- 
-     steps:
-       # Step 1: Check out the repository
-       - name: Checkout repository
-         uses: actions/checkout@v3
- 
-       # Step 2: Set up Python
-       - name: Set up Python
-         uses: actions/setup-python@v4
-         with:
-           python-version: '3.x'
- 
-       # Step 3: Install dependencies
-       - name: Install dependencies
-         run: pip install requests
- 
-       # Step 4: Run the script
-       - name: Run the script
-         env:
-           GITHUB_USERNAME: ${{ secrets.GH_USERNAME }}
-           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-         run: python gh-follow-auto.py
+name: Run GH Follow Manager
+
+on:
+  schedule:
+    # Runs every weekend (Saturday 9 AM and Sunday 6 PM UTC)
+    - cron: '0 9 * * 6'   # Saturday at 9:00 AM UTC
+    - cron: '0 18 * * 0'  # Sunday at 6:00 PM UTC
+  workflow_dispatch:  # Allows manual trigger from GitHub UI
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Check out the repository
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # Step 2: Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      # Step 3: Install dependencies
+      - name: Install dependencies
+        run: |
+          pip install requests schedule
+          pip install urllib3
+
+      # Step 4: Run the script
+      - name: Run GitHub Follow Manager
+        env:
+          GITHUB_USERNAME: ${{ secrets.GH_USERNAME }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: python gh-follow-auto.py --once
+
+      # Step 5: Upload report as artifact
+      - name: Upload sync report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: follow-sync-report
+          path: follow_sync_report_*.txt
+          retention-days: 30
+
+      # Step 6: Send notification (optional)
+      - name: Send notification on failure
+        if: failure()
+        run: |
+          echo "GitHub Follow Manager failed on $(date)" >> failure_log.txt
+          echo "Check workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> failure_log.txt
