@@ -14,18 +14,18 @@ jobs:
     steps:
       # Step 1: Check out the repository
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4  # Updated to v4
 
       # Step 2: Set up Python
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5  # Updated to v5
         with:
           python-version: '3.11'
 
       # Step 3: Install dependencies
       - name: Install dependencies
         run: |
-          pip install requests schedule
+          pip install requests
           pip install urllib3
 
       # Step 4: Run the script
@@ -35,18 +35,31 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: python gh-follow-auto.py --once
 
-      # Step 5: Upload report as artifact
+      # Step 5: Upload report as artifact (UPDATED to v4)
       - name: Upload sync report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4  # Changed from v3 to v4
         if: always()
         with:
-          name: follow-sync-report
+          name: follow-sync-report-${{ github.run_id }}
           path: follow_sync_report_*.txt
           retention-days: 30
+          # Optional: compression level for v4
+          compression-level: 6
+          # Optional: if-no-files-found behavior
+          if-no-files-found: warn
 
-      # Step 6: Send notification (optional)
+      # Step 6: Send notification on failure (optional)
       - name: Send notification on failure
         if: failure()
         run: |
           echo "GitHub Follow Manager failed on $(date)" >> failure_log.txt
           echo "Check workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> failure_log.txt
+      
+      # Step 7: Upload failure log (also using v4)
+      - name: Upload failure log
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: failure-log-${{ github.run_id }}
+          path: failure_log.txt
+          retention-days: 7
