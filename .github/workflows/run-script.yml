@@ -2,12 +2,14 @@ name: Run GH Follow Manager
 
 on:
   schedule:
-    - cron: '0 18 * * 0'  # Sunday 6 PM UTC
+    - cron: '0 18 * * 0'
   workflow_dispatch:
 
 jobs:
   run-script:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout repository
