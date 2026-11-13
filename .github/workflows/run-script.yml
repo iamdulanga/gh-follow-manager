@@ -38,8 +38,8 @@ jobs:
           GITHUB_USERNAME: ${{ secrets.GH_USERNAME }}
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          MODE="${{ github.event.inputs.mode || 'spam' }}"
-          BLOCK_KEEP="${{ github.event.inputs.block_keep || 'false' }}"
+          MODE="${{ github.event.inputs.mode || 'all' }}"
+          BLOCK_KEEP="${{ github.event.inputs.block_keep || 'true' }}"
           ARGS="--mode $MODE"
           if [ "$BLOCK_KEEP" = "true" ]; then
             ARGS="$ARGS --block-keep"
