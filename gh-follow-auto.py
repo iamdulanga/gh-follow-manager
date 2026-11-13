@@ -1,52 +1,159 @@
 import os
+import re
 import time
-from typing import Set, List
+from datetime import datetime, timezone
+from typing import Set, List, Dict, Optional
 from requests import Session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# ─────────────────────────────────────────────
+#  Spam / Bot Detection Heuristics
+# ─────────────────────────────────────────────
+SPAM_BIO_KEYWORDS = re.compile(
+    r'crypto|bitcoin|nft|forex|trading|invest|profit|earn money|onlyfans|adult|'
+    r'escort|porn|xxx|casino|bet|gambling|click here|follow back|followback|'
+    r'instagram follower|tiktok follower|youtube subscriber|cheap|discount|promo',
+    re.IGNORECASE
+)
+
+SPAM_LINK_PATTERNS = re.compile(
+    r'bit\.ly|tinyurl|t\.co|goo\.gl|ow\.ly|rb\.gy|cutt\.ly|'
+    r'telegram\.me|t\.me|wa\.me|discord\.gg',
+    re.IGNORECASE
+)
+
+
+def is_spam_account(profile: dict, min_account_age_days: int = 30) -> tuple[bool, str]:
+    """
+    Analyse a GitHub user profile dict and return (is_spam, reason).
+    Uses multiple weighted heuristics — requires 2+ signals to flag.
+    """
+    signals: list[str] = []
+
+    login       = profile.get("login", "")
+    repos       = profile.get("public_repos", 0)
+    followers   = profile.get("followers", 0)
+    following   = profile.get("following", 0)
+    bio         = profile.get("bio") or ""
+    blog        = profile.get("blog") or ""
+    name        = profile.get("name") or ""
+    company     = profile.get("company") or ""
+    location    = profile.get("location") or ""
+    created_raw = profile.get("created_at", "")
+    gists       = profile.get("public_gists", 0)
+
+    # 1. Completely hollow profile (no repos, no gists, no bio, no name)
+    if repos == 0 and gists == 0 and not bio.strip() and not name.strip():
+        signals.append("hollow profile (0 repos, 0 gists, no name/bio)")
+
+    # 2. Very new account (< min_account_age_days)
+    if created_raw:
+        try:
+            created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            age_days = (datetime.now(timezone.utc) - created_at).days
+            if age_days < min_account_age_days:
+                signals.append(f"very new account ({age_days}d old)")
+        except ValueError:
+            pass
+
+    # 3. Mass-following with almost nobody following back (follow-churn bot)
+    if following >= 100 and followers == 0:
+        signals.append(f"follow-churn bot ({following} following, 0 followers)")
+    elif following > 0 and followers < 5 and following >= 50:
+        ratio = following / max(followers, 1)
+        if ratio > 20:
+            signals.append(f"high following/follower ratio ({following}/{followers} = {ratio:.0f}x)")
+
+    # 4. Spam keywords in bio
+    if SPAM_BIO_KEYWORDS.search(bio):
+        match = SPAM_BIO_KEYWORDS.search(bio).group(0)
+        signals.append(f"spam keyword in bio: '{match}'")
+
+    # 5. Suspicious link in blog/website field
+    if SPAM_LINK_PATTERNS.search(blog):
+        signals.append(f"suspicious link in profile: '{blog[:60]}'")
+
+    # 6. Random-looking username (name+digits pattern, e.g. drydenmitchell, cchongming)
+    #    Combined with other signals – not standalone
+    username_looks_generated = bool(re.fullmatch(r'[a-z]{4,12}[a-z]{4,12}\d{0,4}', login.lower()))
+
+    # Need at least 2 independent signals, OR 1 strong one (spam bio/link)
+    strong_signals = [s for s in signals if "spam keyword" in s or "suspicious link" in s]
+    if strong_signals:
+        return True, " | ".join(signals)
+    if len(signals) >= 2:
+        return True, " | ".join(signals)
+    if len(signals) == 1 and username_looks_generated:
+        return True, signals[0] + " | generated-looking username"
+
+    return False, ""
+
+
+# ─────────────────────────────────────────────
+#  Main Manager
+# ─────────────────────────────────────────────
 class GitHubFollowerManager:
-    """GitHub follower management with verified account protection"""
-    
-    # Verified accounts that should never be unfollowed
+    """GitHub follower management with spam detection, blocking, and removal."""
+
+    # Verified orgs/accounts that should never be touched
     VERIFIED_PROTECTED = {
-        'github', 'microsoft', 'google', 'facebook', 'twitter', 'vercel', 
+        'github', 'microsoft', 'google', 'facebook', 'twitter', 'vercel',
         'netlify', 'aws', 'cloudflare', 'gitlab', 'stackoverflow', 'npmjs'
     }
-    
+
     def __init__(self):
-        self.session = self._create_session()
+        self.session  = self._create_session()
         self.username = os.getenv('GITHUB_USERNAME')
-        self.token = os.getenv('GITHUB_TOKEN')
-        
+        self.token    = os.getenv('GITHUB_TOKEN')
+
         if not self.username or not self.token:
-            raise ValueError("GITHUB_USERNAME and GITHUB_TOKEN required")
-        
+            raise ValueError("GITHUB_USERNAME and GITHUB_TOKEN environment variables are required.")
+
         self.session.headers.update({
             'Authorization': f'token {self.token}',
-            'Accept': 'application/vnd.github.v3+json'
+            'Accept': 'application/vnd.github.v3+json',
+            'X-GitHub-Api-Version': '2022-11-28',
         })
-        
+
         self.exceptions = self._load_exceptions()
-    
+
+    # ── Session ───────────────────────────────
     def _create_session(self) -> Session:
-        """Create optimized session with retry strategy"""
         session = Session()
-        retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+        retry   = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
         adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
-        session.mount('http://', adapter)
+        session.mount('http://',  adapter)
         session.mount('https://', adapter)
         return session
-    
+
+    # ── Persistence ───────────────────────────
     def _load_exceptions(self) -> Set[str]:
-        """Load exception list from file"""
+        """Load usernames that should never be touched (exceptions.txt)."""
         if not os.path.exists("exceptions.txt"):
             return set()
         with open("exceptions.txt", "r") as f:
             return {line.strip().lower() for line in f if line.strip()}
-    
+
+    def _load_blocked_log(self) -> Set[str]:
+        """Load previously blocked/removed usernames to skip re-processing."""
+        if not os.path.exists("spam_blocked.txt"):
+            return set()
+        with open("spam_blocked.txt", "r") as f:
+            return {line.strip().lower() for line in f if line.strip()}
+
+    def _log_blocked(self, username: str, reason: str):
+        with open("spam_blocked.txt", "a") as f:
+            f.write(f"{username}\n")
+        with open("spam_log.txt", "a") as f:
+            f.write(f"{datetime.now().isoformat()} | BLOCKED | @{username} | {reason}\n")
+
+    def _log_action(self, action: str, username: str, detail: str = ""):
+        with open("spam_log.txt", "a") as f:
+            f.write(f"{datetime.now().isoformat()} | {action} | @{username} | {detail}\n")
+
+    # ── API helpers ───────────────────────────
     def _paginated_fetch(self, url: str) -> List:
-        """Fetch all paginated results"""
         results = []
         while url:
             resp = self.session.get(url)
@@ -55,67 +162,225 @@ class GitHubFollowerManager:
             results.extend(resp.json())
             url = resp.links.get('next', {}).get('url')
         return results
-    
+
+    def _get_user_profile(self, username: str) -> Optional[dict]:
+        resp = self.session.get(f'https://api.github.com/users/{username}')
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+
     def _is_protected(self, username: str) -> bool:
-        """Check if account should be protected"""
-        username_lower = username.lower()
-        return (username_lower in self.VERIFIED_PROTECTED or 
-                username_lower in self.exceptions)
-    
-    def sync_follows(self):
-        """Main sync logic"""
-        print(f"🔄 Syncing @{self.username}")
-        
-        # Fetch data
+        u = username.lower()
+        return u in self.VERIFIED_PROTECTED or u in self.exceptions
+
+    # ── Spam actions ──────────────────────────
+    def _block_user(self, username: str) -> bool:
+        """Block a user (requires user:block scope on the token)."""
+        resp = self.session.put(f'https://api.github.com/user/blocks/{username}')
+        return resp.status_code == 204
+
+    def _remove_follower(self, username: str) -> bool:
+        """
+        GitHub has no direct 'remove follower' API.
+        The workaround: block then unblock — this removes them from your followers.
+        """
+        blocked = self._block_user(username)
+        if blocked:
+            time.sleep(0.3)
+            # Unblock restores normal state but they are no longer a follower
+            resp = self.session.delete(f'https://api.github.com/user/blocks/{username}')
+            return resp.status_code == 204
+        return False
+
+    def _unfollow_user(self, username: str) -> bool:
+        resp = self.session.delete(f'https://api.github.com/user/following/{username}')
+        return resp.status_code == 204
+
+    def _follow_user(self, username: str) -> bool:
+        resp = self.session.put(f'https://api.github.com/user/following/{username}')
+        return resp.status_code == 204
+
+    # ── Main flows ────────────────────────────
+    def scan_and_purge_spam(self, block_and_keep: bool = False):
+        """
+        Scan all current followers for spam accounts.
+        For each detected spam account:
+          - If you are following them → unfollow
+          - Block them (removes them from your followers list)
+          - Optionally keep them blocked (block_and_keep=True) or unblock after removal
+
+        Args:
+            block_and_keep: True  → permanently block the spam account.
+                            False → block-then-unblock (removes follower, stays unblocked).
+        """
+        print(f"\n🔍 Scanning followers of @{self.username} for spam accounts …\n")
+
         followers_url = f'https://api.github.com/users/{self.username}/followers?per_page=100'
         following_url = f'https://api.github.com/users/{self.username}/following?per_page=100'
-        
-        followers = {user['login'].lower() for user in self._paginated_fetch(followers_url)}
-        following = {user['login'].lower() for user in self._paginated_fetch(following_url)}
-        
-        print(f"📊 {len(followers)} followers, {len(following)} following")
-        
-        # Calculate differences
+
+        followers_raw = self._paginated_fetch(followers_url)
+        following_set = {u['login'].lower() for u in self._paginated_fetch(following_url)}
+        already_blocked = self._load_blocked_log()
+
+        followers = [u['login'] for u in followers_raw]
+        print(f"📊 {len(followers)} followers found. Checking each profile …\n")
+
+        spam_found     = []
+        spam_skipped   = []
+        errors         = []
+
+        for login in followers:
+            login_lower = login.lower()
+
+            if self._is_protected(login_lower):
+                continue
+            if login_lower in already_blocked:
+                print(f"  ⏭️  Already handled: @{login}")
+                spam_skipped.append(login)
+                continue
+
+            profile = self._get_user_profile(login)
+            if not profile:
+                print(f"  ⚠️  Could not fetch profile for @{login}")
+                errors.append(login)
+                time.sleep(0.5)
+                continue
+
+            flagged, reason = is_spam_account(profile)
+
+            if flagged:
+                print(f"  🚨 SPAM detected: @{login}")
+                print(f"     Reason: {reason}")
+
+                # 1. Unfollow if we were following them
+                if login_lower in following_set:
+                    if self._unfollow_user(login):
+                        print(f"     ✓ Unfollowed @{login}")
+                        self._log_action("UNFOLLOWED", login, reason)
+                    time.sleep(0.4)
+
+                # 2. Block (and optionally keep blocked)
+                if block_and_keep:
+                    if self._block_user(login):
+                        print(f"     🚫 Blocked @{login} (permanent)")
+                        self._log_blocked(login, reason)
+                    else:
+                        print(f"     ❌ Block failed for @{login} (check token scope: user:block)")
+                        errors.append(login)
+                else:
+                    # Block-then-unblock: removes from followers without permanent block
+                    if self._remove_follower(login):
+                        print(f"     ✓ Removed from followers @{login} (block+unblock)")
+                        self._log_blocked(login, reason)
+                    else:
+                        print(f"     ❌ Remove-follower failed for @{login} (check token scope: user:block)")
+                        errors.append(login)
+
+                spam_found.append(login)
+                time.sleep(0.6)
+            else:
+                print(f"  ✅ OK: @{login}")
+                time.sleep(0.2)
+
+        # Summary
+        print("\n" + "=" * 50)
+        print(f"🚨 Spam accounts processed : {len(spam_found)}")
+        print(f"⏭️  Already handled (skipped): {len(spam_skipped)}")
+        print(f"❌ Errors                   : {len(errors)}")
+        if spam_found:
+            print(f"\nBlocked/removed accounts:")
+            for u in spam_found:
+                print(f"  • @{u}")
+        if errors:
+            print(f"\nFailed accounts (check token has 'user:block' scope):")
+            for u in errors:
+                print(f"  • @{u}")
+        print("=" * 50)
+        print(f"\n📄 Full log written to spam_log.txt")
+
+    def sync_follows(self):
+        """
+        Classic reciprocal-follow sync:
+          - Unfollow anyone not following back (skip protected)
+          - Follow back anyone who follows you but you don't follow
+        """
+        print(f"\n🔄 Syncing follows for @{self.username} …\n")
+
+        followers_url = f'https://api.github.com/users/{self.username}/followers?per_page=100'
+        following_url = f'https://api.github.com/users/{self.username}/following?per_page=100'
+
+        followers = {u['login'].lower() for u in self._paginated_fetch(followers_url)}
+        following = {u['login'].lower() for u in self._paginated_fetch(following_url)}
+
+        print(f"📊 {len(followers)} followers | {len(following)} following\n")
+
         not_following_back = following - followers
-        not_followed_back = followers - following
-        
-        # Unfollow non-reciprocal (skip protected)
-        unfollowed = []
+        not_followed_back  = followers - following
+
+        unfollowed, followed = [], []
+
         for user in not_following_back:
             if self._is_protected(user):
-                print(f"🛡️ Skipped protected: {user}")
+                print(f"  🛡️ Protected – skip: @{user}")
                 continue
-            
-            resp = self.session.delete(f'https://api.github.com/user/following/{user}')
-            if resp.status_code == 204:
+            if self._unfollow_user(user):
                 unfollowed.append(user)
-                print(f"✓ Unfollowed: {user}")
+                print(f"  ✓ Unfollowed: @{user}")
             time.sleep(0.5)
-        
-        # Follow back
-        followed = []
-        for user in not_followed_back:
-            resp = self.session.put(f'https://api.github.com/user/following/{user}')
-            if resp.status_code == 204:
-                followed.append(user)
-                print(f"✓ Followed back: {user}")
-            time.sleep(0.5)
-        
-        # Summary
-        print("\n" + "="*40)
-        print(f"✅ Followed back: {len(followed)}")
-        print(f"🗑️ Unfollowed: {len(unfollowed)}")
-        print(f"🛡️ Protected: {len(not_following_back) - len(unfollowed)}")
-        print("="*40)
 
+        for user in not_followed_back:
+            if self._is_protected(user):
+                continue
+            if self._follow_user(user):
+                followed.append(user)
+                print(f"  ✓ Followed back: @{user}")
+            time.sleep(0.5)
+
+        print("\n" + "=" * 40)
+        print(f"✅ Followed back : {len(followed)}")
+        print(f"🗑️  Unfollowed    : {len(unfollowed)}")
+        print(f"🛡️  Protected     : {len(not_following_back) - len(unfollowed)}")
+        print("=" * 40)
+
+
+# ─────────────────────────────────────────────
+#  Entry Point
+# ─────────────────────────────────────────────
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="GitHub Follower Manager")
+    parser.add_argument(
+        "--mode",
+        choices=["sync", "spam", "all"],
+        default="spam",
+        help=(
+            "sync  – reciprocal follow/unfollow only\n"
+            "spam  – scan followers and remove/block spam accounts\n"
+            "all   – spam scan first, then sync (default: spam)"
+        )
+    )
+    parser.add_argument(
+        "--block-keep",
+        action="store_true",
+        default=False,
+        help="Permanently block spam accounts instead of block-then-unblock."
+    )
+    args = parser.parse_args()
+
     try:
         manager = GitHubFollowerManager()
-        manager.sync_follows()
+
+        if args.mode in ("spam", "all"):
+            manager.scan_and_purge_spam(block_and_keep=args.block_keep)
+
+        if args.mode in ("sync", "all"):
+            manager.sync_follows()
+
         return 0
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"\n❌ Fatal error: {e}")
         return 1
+
 
 if __name__ == "__main__":
     exit(main())

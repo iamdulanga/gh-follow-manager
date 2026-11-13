@@ -2,8 +2,18 @@ name: Run GH Follow Manager
 
 on:
   schedule:
-    - cron: '0 18 * * 0'
+    # Spam scan: every day at 18:00 UTC
+    - cron: '0 18 * * *'
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Mode: spam | sync | all'
+        required: false
+        default: 'spam'
+      block_keep:
+        description: 'Permanently block spam accounts? (true/false)'
+        required: false
+        default: 'false'
 
 jobs:
   run-script:
@@ -27,4 +37,11 @@ jobs:
         env:
           GITHUB_USERNAME: ${{ secrets.GH_USERNAME }}
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: python gh-follow-auto.py
+        run: |
+          MODE="${{ github.event.inputs.mode || 'spam' }}"
+          BLOCK_KEEP="${{ github.event.inputs.block_keep || 'false' }}"
+          ARGS="--mode $MODE"
+          if [ "$BLOCK_KEEP" = "true" ]; then
+            ARGS="$ARGS --block-keep"
+          fi
+          python gh-follow-auto.py $ARGS
