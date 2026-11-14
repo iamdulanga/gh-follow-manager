@@ -9,11 +9,11 @@ on:
       mode:
         description: 'Mode: spam | sync | all'
         required: false
-        default: 'spam'
+        default: 'all'
       block_keep:
         description: 'Permanently block spam accounts? (true/false)'
         required: false
-        default: 'false'
+        default: 'true'
 
 jobs:
   run-script:
