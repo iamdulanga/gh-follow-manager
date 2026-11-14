@@ -298,11 +298,21 @@ class GitHubFollowerManager:
         print("=" * 50)
         print(f"\n📄 Full log written to spam_log.txt")
 
-    def sync_follows(self):
+        # Return the set of spam logins found this session
+        # so sync_follows() can exclude them without re-fetching
+        return {u.lower() for u in spam_found}
+
+    def sync_follows(self, known_spam: Set[str] = None):
         """
-        Classic reciprocal-follow sync:
-          - Unfollow anyone not following back (skip protected)
-          - Follow back anyone who follows you but you don't follow
+        Reciprocal-follow sync:
+          - Unfollow anyone not following back (skip protected & spam)
+          - Follow back anyone who follows you but you don't follow,
+            AFTER verifying they are not a spam account.
+
+        Args:
+            known_spam: Set of logins already flagged as spam (from scan_and_purge_spam).
+                        sync_follows also loads spam_blocked.txt and re-checks each
+                        candidate before following back.
         """
         print(f"\n🔄 Syncing follows for @{self.username} …\n")
 
@@ -312,34 +322,81 @@ class GitHubFollowerManager:
         followers = {u['login'].lower() for u in self._paginated_fetch(followers_url)}
         following = {u['login'].lower() for u in self._paginated_fetch(following_url)}
 
-        print(f"📊 {len(followers)} followers | {len(following)} following\n")
+        # Build a combined spam exclusion list:
+        #   • accounts passed in from spam scan this session
+        #   • accounts previously blocked (spam_blocked.txt)
+        spam_exclusions = set(known_spam or set())
+        spam_exclusions |= self._load_blocked_log()
+
+        print(f"📊 {len(followers)} followers | {len(following)} following")
+        print(f"🚫 {len(spam_exclusions)} spam exclusions loaded\n")
 
         not_following_back = following - followers
         not_followed_back  = followers - following
 
-        unfollowed, followed = [], []
+        unfollowed, followed, spam_skipped = [], [], []
 
+        # ── Unfollow non-reciprocal (skip protected & known spam) ──────────
         for user in not_following_back:
             if self._is_protected(user):
                 print(f"  🛡️ Protected – skip: @{user}")
+                continue
+            if user in spam_exclusions:
+                # Already blocked/removed — also unfollow if still following
+                if self._unfollow_user(user):
+                    print(f"  🚫 Unfollowed known spam: @{user}")
+                    unfollowed.append(user)
                 continue
             if self._unfollow_user(user):
                 unfollowed.append(user)
                 print(f"  ✓ Unfollowed: @{user}")
             time.sleep(0.5)
 
+        # ── Follow back — but verify not spam first ─────────────────────────
         for user in not_followed_back:
             if self._is_protected(user):
                 continue
-            if self._follow_user(user):
+
+            # Skip if already known spam
+            if user in spam_exclusions:
+                print(f"  🚨 Skip follow-back (known spam): @{user}")
+                spam_skipped.append(user)
+                continue
+
+            # Fetch profile and run spam check before following back
+            profile = self._get_user_profile(user)
+            if profile:
+                flagged, reason = is_spam_account(profile)
+                if flagged:
+                    print(f"  🚨 Spam detected at follow-back stage: @{user} ({reason})")
+                    self._remove_follower(user)
+                    self._log_blocked(user, f"[sync-stage] {reason}")
+                    spam_skipped.append(user)
+                    time.sleep(0.6)
+                    continue
+
+            # Attempt follow-back
+            follow_resp = self.session.put(f'https://api.github.com/user/following/{user}')
+            if follow_resp.status_code == 204:
                 followed.append(user)
                 print(f"  ✓ Followed back: @{user}")
+            else:
+                # Follow failed → account is suspended, deleted, or restricted by GitHub
+                # (no follow button on their profile). Remove them from your followers
+                # so they no longer inflate your follower count.
+                print(f"  👻 Ghost/restricted follower: @{user} (follow returned {follow_resp.status_code}) — removing")
+                if self._remove_follower(user):
+                    self._log_action("REMOVED_GHOST", user, f"follow-back failed with HTTP {follow_resp.status_code}")
+                    spam_skipped.append(user)
+                else:
+                    self._log_action("REMOVE_GHOST_FAILED", user, f"follow-back failed with HTTP {follow_resp.status_code}")
             time.sleep(0.5)
 
         print("\n" + "=" * 40)
-        print(f"✅ Followed back : {len(followed)}")
-        print(f"🗑️  Unfollowed    : {len(unfollowed)}")
-        print(f"🛡️  Protected     : {len(not_following_back) - len(unfollowed)}")
+        print(f"✅ Followed back      : {len(followed)}")
+        print(f"🗑️  Unfollowed         : {len(unfollowed)}")
+        print(f"👻 Ghost/spam removed : {len(spam_skipped)}")
+        print(f"🛡️  Protected          : {len([u for u in not_following_back if self._is_protected(u)])}")
         print("=" * 40)
 
 
@@ -370,11 +427,13 @@ def main():
     try:
         manager = GitHubFollowerManager()
 
+        spam_set = set()
         if args.mode in ("spam", "all"):
-            manager.scan_and_purge_spam(block_and_keep=args.block_keep)
+            spam_set = manager.scan_and_purge_spam(block_and_keep=args.block_keep)
 
         if args.mode in ("sync", "all"):
-            manager.sync_follows()
+            # Pass spam accounts found this session so sync doesn't follow them back
+            manager.sync_follows(known_spam=spam_set)
 
         return 0
     except Exception as e:
