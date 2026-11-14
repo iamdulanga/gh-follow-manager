@@ -23,14 +23,34 @@ SPAM_LINK_PATTERNS = re.compile(
     re.IGNORECASE
 )
 
+# Username patterns typical of bot/spam account generators
+_REPEATED_CHARS   = re.compile(r'(.)\1{3,}')                         # 4+ same char: mmmm, pppp
+_BOT_NAME_PATTERN = re.compile(r'^[a-z]{3,10}[a-z]{3,10}\d{0,6}$')  # firstname+lastname±digits
+_LEETSPEAK_HEAVY  = re.compile(r'(?:[0-9][a-z]|[a-z][0-9]){3,}')    # alternating letter/digit: a1b2c3
+_NAME_DIGITS      = re.compile(r'^[a-z]{3,}\d{4,}$')                 # name + 4+ digits: john1234
+
+
+def _username_is_suspicious(login: str) -> tuple[bool, str]:
+    lo = login.lower()
+    if _REPEATED_CHARS.search(lo):
+        return True, f"repeated chars in username ('{login}')"
+    if _LEETSPEAK_HEAVY.search(lo):
+        return True, f"heavy leetspeak username ('{login}')"
+    if _NAME_DIGITS.match(lo):
+        return True, f"name+digits username ('{login}')"
+    if _BOT_NAME_PATTERN.match(lo) and len(lo) >= 10:
+        return True, f"bot name-pattern username ('{login}')"
+    return False, ""
+
 
 def is_spam_account(profile: dict, min_account_age_days: int = 30) -> tuple[bool, str]:
     """
     Analyse a GitHub user profile dict and return (is_spam, reason).
-    Uses multiple weighted heuristics — requires 2+ signals to flag.
+    Scoring:
+      • 1 STRONG signal  → spam  (bio keyword, suspicious link, obvious username + hollow/ratio)
+      • 2+ weak signals  → spam
+      • 1 weak + suspicious username → spam
     """
-    signals: list[str] = []
-
     login       = profile.get("login", "")
     repos       = profile.get("public_repos", 0)
     followers   = profile.get("followers", 0)
@@ -38,16 +58,30 @@ def is_spam_account(profile: dict, min_account_age_days: int = 30) -> tuple[bool
     bio         = profile.get("bio") or ""
     blog        = profile.get("blog") or ""
     name        = profile.get("name") or ""
-    company     = profile.get("company") or ""
-    location    = profile.get("location") or ""
     created_raw = profile.get("created_at", "")
     gists       = profile.get("public_gists", 0)
 
-    # 1. Completely hollow profile (no repos, no gists, no bio, no name)
+    # ── Strong signals (1 is enough) ─────────────────────────────────────
+    if SPAM_BIO_KEYWORDS.search(bio):
+        return True, f"spam keyword in bio: '{SPAM_BIO_KEYWORDS.search(bio).group(0)}'"
+
+    if SPAM_LINK_PATTERNS.search(blog):
+        return True, f"suspicious link in profile: '{blog[:60]}'"
+
+    sus_username, username_reason = _username_is_suspicious(login)
+    if sus_username and (repos == 0 or following > max(followers, 1) * 5):
+        # Obvious bot username + hollow OR mass-following = strong enough alone
+        extra = "0 repos" if repos == 0 else f"{following} following / {followers} followers"
+        return True, f"{username_reason} | {extra}"
+
+    # ── Weak signals (need 2+, or 1 + suspicious username) ───────────────
+    signals: list[str] = []
+
+    # Hollow profile
     if repos == 0 and gists == 0 and not bio.strip() and not name.strip():
         signals.append("hollow profile (0 repos, 0 gists, no name/bio)")
 
-    # 2. Very new account (< min_account_age_days)
+    # Very new account
     if created_raw:
         try:
             created_at = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
@@ -57,35 +91,23 @@ def is_spam_account(profile: dict, min_account_age_days: int = 30) -> tuple[bool
         except ValueError:
             pass
 
-    # 3. Mass-following with almost nobody following back (follow-churn bot)
-    if following >= 100 and followers == 0:
-        signals.append(f"follow-churn bot ({following} following, 0 followers)")
-    elif following > 0 and followers < 5 and following >= 50:
-        ratio = following / max(followers, 1)
-        if ratio > 20:
-            signals.append(f"high following/follower ratio ({following}/{followers} = {ratio:.0f}x)")
+    # Mass-following / follow-churn (relaxed thresholds)
+    if following >= 50:
+        if followers == 0:
+            signals.append(f"follow-churn bot ({following} following, 0 followers)")
+        else:
+            ratio = following / max(followers, 1)
+            if ratio >= 10:
+                signals.append(f"high follow ratio ({following}/{followers} = {ratio:.0f}x)")
 
-    # 4. Spam keywords in bio
-    if SPAM_BIO_KEYWORDS.search(bio):
-        match = SPAM_BIO_KEYWORDS.search(bio).group(0)
-        signals.append(f"spam keyword in bio: '{match}'")
+    # Mass-following with zero content
+    if following >= 100 and repos == 0 and not bio.strip():
+        signals.append(f"mass-following with no content ({following} following, 0 repos)")
 
-    # 5. Suspicious link in blog/website field
-    if SPAM_LINK_PATTERNS.search(blog):
-        signals.append(f"suspicious link in profile: '{blog[:60]}'")
-
-    # 6. Random-looking username (name+digits pattern, e.g. drydenmitchell, cchongming)
-    #    Combined with other signals – not standalone
-    username_looks_generated = bool(re.fullmatch(r'[a-z]{4,12}[a-z]{4,12}\d{0,4}', login.lower()))
-
-    # Need at least 2 independent signals, OR 1 strong one (spam bio/link)
-    strong_signals = [s for s in signals if "spam keyword" in s or "suspicious link" in s]
-    if strong_signals:
-        return True, " | ".join(signals)
     if len(signals) >= 2:
         return True, " | ".join(signals)
-    if len(signals) == 1 and username_looks_generated:
-        return True, signals[0] + " | generated-looking username"
+    if len(signals) == 1 and sus_username:
+        return True, signals[0] + " | " + username_reason
 
     return False, ""
 
@@ -133,7 +155,7 @@ class GitHubFollowerManager:
         if not os.path.exists("exceptions.txt"):
             return set()
         with open("exceptions.txt", "r") as f:
-            return {line.strip().lower() for line in f if line.strip()}
+            return {line.strip().lower() for line in f if line.strip() and not line.startswith("#")}
 
     def _load_blocked_log(self) -> Set[str]:
         """Load previously blocked/removed usernames to skip re-processing."""
