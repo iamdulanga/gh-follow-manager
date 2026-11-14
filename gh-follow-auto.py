@@ -174,23 +174,36 @@ class GitHubFollowerManager:
         return u in self.VERIFIED_PROTECTED or u in self.exceptions
 
     # ── Spam actions ──────────────────────────
-    def _block_user(self, username: str) -> bool:
-        """Block a user (requires user:block scope on the token)."""
+    def _block_user(self, username: str) -> tuple[bool, int]:
+        """Block a user. Returns (success, http_status_code)."""
         resp = self.session.put(f'https://api.github.com/user/blocks/{username}')
-        return resp.status_code == 204
+        return resp.status_code == 204, resp.status_code
 
-    def _remove_follower(self, username: str) -> bool:
+    def _unblock_user(self, username: str) -> tuple[bool, int]:
+        """Unblock a user. Returns (success, http_status_code)."""
+        resp = self.session.delete(f'https://api.github.com/user/blocks/{username}')
+        return resp.status_code == 204, resp.status_code
+
+    def _remove_follower(self, username: str) -> tuple[bool, str]:
         """
-        GitHub has no direct 'remove follower' API.
-        The workaround: block then unblock — this removes them from your followers.
+        Remove a follower via block→unblock trick.
+        Returns (success, detail_message).
         """
-        blocked = self._block_user(username)
-        if blocked:
-            time.sleep(0.3)
-            # Unblock restores normal state but they are no longer a follower
-            resp = self.session.delete(f'https://api.github.com/user/blocks/{username}')
-            return resp.status_code == 204
-        return False
+        blocked, block_code = self._block_user(username)
+        if not blocked:
+            if block_code == 422:
+                # 422 = account suspended by GitHub — block not needed, they're already restricted
+                # They will naturally drop from follower count as GitHub purges suspended accounts
+                return False, f"account suspended by GitHub (block returned {block_code})"
+            if block_code == 404:
+                return False, f"account not found/deleted (block returned {block_code})"
+            return False, f"block failed with HTTP {block_code} — check token has 'Block and unblock users: Read and write' permission"
+
+        time.sleep(0.3)
+        unblocked, unblock_code = self._unblock_user(username)
+        if unblocked:
+            return True, "block+unblock succeeded"
+        return False, f"block succeeded but unblock failed with HTTP {unblock_code}"
 
     def _unfollow_user(self, username: str) -> bool:
         resp = self.session.delete(f'https://api.github.com/user/following/{username}')
@@ -261,19 +274,21 @@ class GitHubFollowerManager:
 
                 # 2. Block (and optionally keep blocked)
                 if block_and_keep:
-                    if self._block_user(login):
+                    ok, code = self._block_user(login)
+                    if ok:
                         print(f"     🚫 Blocked @{login} (permanent)")
                         self._log_blocked(login, reason)
                     else:
-                        print(f"     ❌ Block failed for @{login} (check token scope: user:block)")
+                        print(f"     ❌ Block failed for @{login} — HTTP {code}")
                         errors.append(login)
                 else:
                     # Block-then-unblock: removes from followers without permanent block
-                    if self._remove_follower(login):
+                    ok, detail = self._remove_follower(login)
+                    if ok:
                         print(f"     ✓ Removed from followers @{login} (block+unblock)")
                         self._log_blocked(login, reason)
                     else:
-                        print(f"     ❌ Remove-follower failed for @{login} (check token scope: user:block)")
+                        print(f"     ❌ Remove-follower failed for @{login}: {detail}")
                         errors.append(login)
 
                 spam_found.append(login)
@@ -334,7 +349,7 @@ class GitHubFollowerManager:
         not_following_back = following - followers
         not_followed_back  = followers - following
 
-        unfollowed, followed, spam_skipped = [], [], []
+        unfollowed, followed, spam_skipped, ghost_removed = [], [], [], []
 
         # ── Unfollow non-reciprocal (skip protected & known spam) ──────────
         for user in not_following_back:
@@ -382,20 +397,23 @@ class GitHubFollowerManager:
                 print(f"  ✓ Followed back: @{user}")
             else:
                 # Follow failed → account is suspended, deleted, or restricted by GitHub
-                # (no follow button on their profile). Remove them from your followers
-                # so they no longer inflate your follower count.
-                print(f"  👻 Ghost/restricted follower: @{user} (follow returned {follow_resp.status_code}) — removing")
-                if self._remove_follower(user):
-                    self._log_action("REMOVED_GHOST", user, f"follow-back failed with HTTP {follow_resp.status_code}")
-                    spam_skipped.append(user)
+                # (no follow button on their profile). Try to remove from followers.
+                print(f"  👻 Ghost/restricted: @{user} (follow returned {follow_resp.status_code}) — removing")
+                ghost_removed.append(user)  # count it regardless of whether removal succeeds
+                ok, detail = self._remove_follower(user)
+                if ok:
+                    self._log_action("REMOVED_GHOST", user, f"follow HTTP {follow_resp.status_code} | {detail}")
+                    print(f"     ✓ Removed from followers")
                 else:
-                    self._log_action("REMOVE_GHOST_FAILED", user, f"follow-back failed with HTTP {follow_resp.status_code}")
+                    self._log_action("REMOVE_GHOST_FAILED", user, f"follow HTTP {follow_resp.status_code} | {detail}")
+                    print(f"     ⚠️  Could not remove: {detail}")
             time.sleep(0.5)
 
         print("\n" + "=" * 40)
         print(f"✅ Followed back      : {len(followed)}")
         print(f"🗑️  Unfollowed         : {len(unfollowed)}")
-        print(f"👻 Ghost/spam removed : {len(spam_skipped)}")
+        print(f"👻 Ghost/restricted   : {len(ghost_removed)} detected ({len([u for u in ghost_removed if u not in spam_skipped])} removal failed)")
+        print(f"🚨 Spam skipped       : {len(spam_skipped)}")
         print(f"🛡️  Protected          : {len([u for u in not_following_back if self._is_protected(u)])}")
         print("=" * 40)
 
