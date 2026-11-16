@@ -1,8 +1,8 @@
 __pycache__/
 *.pyc
 restore_unblock_local.py
+find_spam_followers.py
 check_users.py
 test_heuristics.py
 spam_log.txt
 spam_blocked.txt
-
