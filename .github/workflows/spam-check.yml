@@ -1,0 +1,32 @@
+name: Spam Check & Block
+
+on:
+  schedule:
+    # Runs every Saturday at 03:00 UTC (8:30 AM IST/local time)
+    - cron: '0 3 * * 6'
+  workflow_dispatch:
+
+jobs:
+  spam-check:
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Spam Follower Finder & Blocker
+        env:
+          GITHUB_USERNAME: ${{ secrets.GH_USERNAME }}
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: python find_spam_followers.py --auto-block
+

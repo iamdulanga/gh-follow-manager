@@ -2,7 +2,8 @@ name: Run GH Follow Manager
 
 on:
   schedule:
-    - cron: '0 18 * * *'
+    # Runs every Sunday at 03:00 UTC (8:30 AM IST/local time)
+    - cron: '0 3 * * 0'
   workflow_dispatch:
 
 jobs:
