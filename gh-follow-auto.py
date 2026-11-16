@@ -19,6 +19,11 @@ class GitHubFollowerManager:
         self.username = os.getenv('GITHUB_USERNAME')
         self.token = os.getenv('GITHUB_TOKEN')
 
+        if not self.username:
+            self.username = input("Enter GITHUB_USERNAME (e.g. iamdulanga): ").strip()
+        if not self.token:
+            self.token = input("Enter GITHUB_TOKEN: ").strip()
+
         if not self.username or not self.token:
             raise ValueError("GITHUB_USERNAME and GITHUB_TOKEN required")
 
