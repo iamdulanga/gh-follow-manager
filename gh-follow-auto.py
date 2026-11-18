@@ -108,8 +108,8 @@ class GitHubFollowerManager:
         if spam_link.search(blog) and repos == 0:
             return True
 
-        # Flagged/shadowbanned ghost (0/0/0 with no name)
-        if following == 0 and followers == 0 and repos <= 2 and not name.strip():
+        # Dead / flagged account (0 followers, 0 following, 0 repos)
+        if following == 0 and followers == 0 and repos == 0:
             return True
 
         # Extreme follow-churn bot

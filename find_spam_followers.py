@@ -58,16 +58,19 @@ def evaluate_account(profile: dict) -> Tuple[bool, str]:
     if m_link and repos == 0:
         return True, f"Suspicious link in profile: '{blog[:60]}'"
 
-    # Rule 3: Flagged / shadowbanned ghost bot anomaly
+    # Rule 3: Dead / flagged / shadowbanned account
     # If an account follows you, following should normally be >= 1.
     # When GitHub flags/restricts bot networks, it zeroes out followers and following to 0.
     if following == 0 and followers == 0:
+        # 3a: Bot redirecting to another account via bio
         if re.search(r'@[A-Za-z0-9_-]+', bio):
             return True, f"Flagged bot redirecting to: '{bio.strip()}'"
+        # 3b: Generated username pattern
         if REPEATED_CHARS.search(login):
             return True, f"Flagged bot with generated username ('{login}')"
-        if repos <= 2 and not name.strip():
-            return True, "Flagged/shadowbanned ghost account (0 followers, 0 following, no repos/name)"
+        # 3c: Completely dead account (0/0/0) — no activity at all
+        if repos == 0:
+            return True, "Dead account (0 followers, 0 following, 0 repos)"
 
     # Rule 4: Extreme follow-churn bot
     if following >= 200 and followers == 0 and repos == 0 and not bio.strip():
