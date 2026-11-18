@@ -100,8 +100,7 @@ class SpamFollowerFinder:
                 print(f"\n❌ Failed to fetch followers: HTTP {resp.status_code}")
                 print(f"Response: {resp.text}")
                 raise RuntimeError("Failed to fetch GitHub followers.")
-                        # pyrefly: ignore[parse-error]
-                        followers.extend(resp.json())
+            followers.extend(resp.json())
             url = resp.links.get("next", {}).get("url")
         return followers
 
