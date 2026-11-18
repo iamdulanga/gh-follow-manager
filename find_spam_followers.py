@@ -97,9 +97,11 @@ class SpamFollowerFinder:
         while url:
             resp = self.session.get(url)
             if resp.status_code != 200:
-                print(f"❌ Failed to fetch followers: HTTP {resp.status_code}")
-                break
-            followers.extend(resp.json())
+                print(f"\n❌ Failed to fetch followers: HTTP {resp.status_code}")
+                print(f"Response: {resp.text}")
+                raise RuntimeError("Failed to fetch GitHub followers.")
+                        # pyrefly: ignore[parse-error]
+                        followers.extend(resp.json())
             url = resp.links.get("next", {}).get("url")
         return followers
 
@@ -114,7 +116,7 @@ class SpamFollowerFinder:
         resp = self.session.put(f"https://api.github.com/user/blocks/{login}")
         return resp.status_code == 204
 
-    def run(self):
+    def run(self, auto_block=False):
         print(f"\n🔍 Fetching followers for @{self.username} ...")
         raw_followers = self.fetch_all_followers()
         total = len(raw_followers)
