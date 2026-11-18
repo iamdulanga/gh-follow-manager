@@ -1,6 +1,7 @@
 import os
+import re
 import time
-from typing import Set, List
+from typing import Set, List, Optional
 from requests import Session
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -67,6 +68,56 @@ class GitHubFollowerManager:
         return (username_lower in self.VERIFIED_PROTECTED or
                 username_lower in self.exceptions)
 
+    def _get_profile(self, login: str) -> Optional[dict]:
+        """Fetch a user's profile. Returns None if suspended/deleted."""
+        resp = self.session.get(f'https://api.github.com/users/{login}')
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+
+    def _is_spam_account(self, profile: dict) -> bool:
+        """Check if the account is spam/bot/suspended — skip following it."""
+        repos     = profile.get("public_repos", 0)
+        followers = profile.get("followers", 0)
+        following = profile.get("following", 0)
+        bio       = profile.get("bio") or ""
+        blog      = profile.get("blog") or ""
+        name      = profile.get("name") or ""
+        login     = profile.get("login", "")
+
+        # Spam keywords in bio
+        spam_bio = re.compile(
+            r'\bspam\s+(?:follow|following|acc|account|bot)\b|'
+            r'\b(?:follow|check)\s+(?:my\s+)?main\b|'
+            r'\bmain\s+(?:acc|account)\s*[@:]|'
+            r'\balt\s+(?:acc|account)\b|'
+            r'crypto|bitcoin|nft|forex|trading|profit|earn\s+money|'
+            r'onlyfans|adult|escort|porn|xxx|casino|gambling|'
+            r'follow\s+back\s+or\s+unfollow',
+            re.IGNORECASE
+        )
+        if spam_bio.search(bio):
+            return True
+
+        # Suspicious shortlink with 0 repos
+        spam_link = re.compile(
+            r'bit\.ly|tinyurl|t\.co|goo\.gl|ow\.ly|rb\.gy|cutt\.ly|'
+            r'telegram\.me|t\.me|wa\.me|discord\.gg',
+            re.IGNORECASE
+        )
+        if spam_link.search(blog) and repos == 0:
+            return True
+
+        # Flagged/shadowbanned ghost (0/0/0 with no name)
+        if following == 0 and followers == 0 and repos <= 2 and not name.strip():
+            return True
+
+        # Extreme follow-churn bot
+        if following >= 200 and followers == 0 and repos == 0 and not bio.strip():
+            return True
+
+        return False
+
     def sync_follows(self):
         """Main sync logic"""
         print(f"🔄 Syncing @{self.username}")
@@ -97,9 +148,24 @@ class GitHubFollowerManager:
                 print(f"✓ Unfollowed: @{user}")
             time.sleep(0.5)
 
-        # Follow back
+        # Follow back (skip spam/suspended accounts)
         followed = []
+        skipped_spam = []
         for user in not_followed_back:
+            profile = self._get_profile(user)
+            if profile is None:
+                # Account is suspended or deleted — can't follow
+                skipped_spam.append(user)
+                print(f"⛔ Skipped (suspended/deleted): @{user}")
+                time.sleep(0.3)
+                continue
+
+            if self._is_spam_account(profile):
+                skipped_spam.append(user)
+                print(f"⛔ Skipped (spam/bot): @{user}")
+                time.sleep(0.3)
+                continue
+
             resp = self.session.put(f'https://api.github.com/user/following/{user}')
             if resp.status_code == 204:
                 followed.append(user)
@@ -109,6 +175,7 @@ class GitHubFollowerManager:
         # Summary
         print("\n" + "=" * 40)
         print(f"✅ Followed back : {len(followed)}")
+        print(f"⛔ Skipped spam  : {len(skipped_spam)}")
         print(f"🗑️  Unfollowed    : {len(unfollowed)}")
         print(f"🛡️  Protected     : {len(not_following_back) - len(unfollowed)}")
         print("=" * 40)
